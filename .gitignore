@@ -1,0 +1,11 @@
+# Generated outputs(not tracked), regenerate via the pipeline scripts
+output/
+*.ply
+*.pcd
+*.npy
+venv/
+__pycache__/
+*.pyc
+output/dataset_index*.json
+forest_49_map_new/
+forest_dataset_49/
