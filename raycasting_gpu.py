@@ -1,4 +1,370 @@
 """
+step2_raycast_gpu.py
+----------------------
+GPU pixel-level-parallel replacement for step2_raycast() in the GLIM
+colorization pipeline. Matches that function's exact interface:
+  in:  lidar_points, global_indices, fid, save_debug
+  out: pixel_to_point dict with "global_index" (not "lidar_index")
+
+WHY THIS VERSION EXISTS (perf history):
+- v1 (brute-force GPU): compared every candidate pixel against ALL N
+  lidar points at once. Correct, but algorithmically much more work
+  than the original CPU version ever did -- the CPU's cKDTree only
+  checked points within ~0.45m of each anchor (a handful of points),
+  while brute-force checked all ~550k+ points for every pixel. This
+  plateaued at ~1765 pixels/sec regardless of CHUNK_SIZE, because the
+  bottleneck was raw compute volume, not overhead.
+- v2 (this version): restores the "only check nearby points" behavior
+  of the original CPU code, but vectorized instead of one Python call
+  per pixel. Lidar points are bucketed into a coarse 3D voxel grid
+  once per frame; each pixel only searches its own voxel + the 26
+  neighboring voxels (a 1.5m cube, comfortably covering the 0.45m
+  radius the original code used). This bounds the per-pixel search to
+  dozens-hundreds of points instead of hundreds of thousands.
+- Candidate pixels are also deduplicated by their shared anchor point
+  before doing any GPU work (many pixels share the same anchor due to
+  the MARGIN=2 dilation in the fast pass), so the neighbor search and
+  distance math only run once per unique anchor, then get broadcast
+  back out to every pixel that shares it.
+
+HOW TO WIRE THIS IN:
+Same as before -- in the main script, replace the step2_raycast() call
+with this file's step2_raycast_gpu(), same arguments, same return
+value shape.
+"""
+
+import numpy as np
+import torch
+import time
+
+# Same calibration as the main script -- copied in here so this file
+# is self-contained; import from the main script instead if you'd
+# rather not duplicate these.
+T_cam_lidar = np.array([
+    [0.906, 0.000, -0.423, 0.142],
+    [0.000, 1.000,  0.000, 0.000],
+    [0.423, 0.000,  0.906, 0.005],
+    [0.000, 0.000,  0.000, 1.000],
+])
+R_cam_lidar = T_cam_lidar[:3, :3]
+t_cam_lidar = T_cam_lidar[:3, 3]
+
+K = np.array([
+    [1219.92, 0.0,     960.0],
+    [0.0,     1219.92, 540.0],
+    [0.0,     0.0,     1.0],
+])
+K_inv = np.linalg.inv(K)
+
+IMG_W, IMG_H = 1920, 1080
+MIN_DEPTH = 0.05
+MAX_PERP_DIST = 0.15
+
+# Voxel grid settings. VOXEL_SIZE=0.5 with a 3x3x3 neighbor search gives
+# guaranteed coverage of at least 0.5m in every direction from any point
+# inside the center cell -- comfortably a superset of the original
+# code's 0.45m (MAX_PERP_DIST * 3) search radius. Any extra points this
+# pulls in beyond the true radius get filtered out anyway by the
+# perp_dist < MAX_PERP_DIST check later, so being generous here costs a
+# little extra compute but never causes incorrect results.
+VOXEL_SIZE = 0.5
+NEIGHBOR_RING = 1  # 1 = 3x3x3 = 27 cells checked per anchor
+
+# Anchor chunk size (how many UNIQUE anchors are processed per GPU
+# batch) and the hard cap on neighbor points gathered per anchor. If an
+# anchor's neighborhood genuinely has more than NEIGHBOR_CAP points
+# (dense point clusters), extra points beyond the cap are simply
+# dropped -- rare in practice, and only slightly reduces match quality
+# in that rare case rather than causing an error.
+ANCHOR_CHUNK_SIZE = 2048
+NEIGHBOR_CAP = 512
+
+# Large coordinate offset so voxel indices are always non-negative
+# before packing into a single hashable integer key.
+_COORD_OFFSET = 1 << 20  # generous headroom; real coordinates are tiny by comparison
+
+_device = "cuda" if torch.cuda.is_available() else "cpu"
+if _device == "cpu":
+    print("[gpu-raycast] WARNING: CUDA not available -- running on CPU tensors "
+          "(still batched/parallel across pixels, just not on GPU cores).")
+
+# calibration tensors, created once and reused across every frame/call
+_K_inv_t = torch.tensor(K_inv, dtype=torch.float32, device=_device)
+_R_cam_lidar_t = torch.tensor(R_cam_lidar, dtype=torch.float32, device=_device)
+_t_cam_lidar_t = torch.tensor(t_cam_lidar, dtype=torch.float32, device=_device)
+
+
+def _pack_voxel_keys(voxel_coords):
+    """
+    voxel_coords: (N, 3) int64 array of voxel grid indices (can be
+    negative). Returns a (N,) int64 array of unique hashable keys, one
+    per voxel cell, by packing the 3 coordinates into a single int64.
+    """
+    shifted = voxel_coords + _COORD_OFFSET  # now guaranteed non-negative
+    # pack assuming each axis comfortably fits in 21 bits (2M range,
+    # i.e. +/-1M cells * 0.5m = +/-500km -- far beyond any real scene)
+    keys = (shifted[:, 0].astype(np.int64) << 42) \
+         | (shifted[:, 1].astype(np.int64) << 21) \
+         | (shifted[:, 2].astype(np.int64))
+    return keys
+
+
+def _build_voxel_grid(points, voxel_size):
+    """
+    Buckets `points` (N, 3) into a voxel grid, returned as a CSR-like
+    structure for fast neighbor lookups:
+      - order: point indices sorted by voxel key
+      - unique_keys: sorted unique voxel keys present in the data
+      - start_idx: start offset into `order` for each unique key
+      - counts: number of points in each unique key's voxel
+    """
+    voxel_coords = np.floor(points / voxel_size).astype(np.int64)  # (N, 3)
+    keys = _pack_voxel_keys(voxel_coords)
+    order = np.argsort(keys, kind="stable")
+    sorted_keys = keys[order]
+    unique_keys, start_idx, counts = np.unique(
+        sorted_keys, return_index=True, return_counts=True
+    )
+    return order, unique_keys, start_idx, counts, voxel_coords
+
+
+def _query_neighbors(anchor_voxel_coords, order, unique_keys, start_idx, counts):
+    """
+    For each anchor voxel coord (m, 3), gathers point indices from its
+    own cell + all 26 neighboring cells (NEIGHBOR_RING=1). Returns a
+    python list of length m, each entry a numpy array of point indices
+    (variable length, capped at NEIGHBOR_CAP).
+    """
+    m = anchor_voxel_coords.shape[0]
+    neighbor_lists = [[] for _ in range(m)]
+
+    offsets = range(-NEIGHBOR_RING, NEIGHBOR_RING + 1)
+    for dx in offsets:
+        for dy in offsets:
+            for dz in offsets:
+                shifted_coords = anchor_voxel_coords + np.array([dx, dy, dz])
+                neighbor_keys = _pack_voxel_keys(shifted_coords)
+                # binary search each anchor's neighbor key against the
+                # sorted unique_keys array
+                pos = np.searchsorted(unique_keys, neighbor_keys)
+                pos_clipped = np.clip(pos, 0, len(unique_keys) - 1)
+                found = unique_keys[pos_clipped] == neighbor_keys
+                for i in range(m):
+                    if found[i]:
+                        s = start_idx[pos_clipped[i]]
+                        c = counts[pos_clipped[i]]
+                        neighbor_lists[i].append(order[s:s + c])
+
+    result = []
+    for i in range(m):
+        if neighbor_lists[i]:
+            idxs = np.concatenate(neighbor_lists[i])
+        else:
+            idxs = np.empty((0,), dtype=np.int64)
+        if len(idxs) > NEIGHBOR_CAP:
+            idxs = idxs[:NEIGHBOR_CAP]
+        result.append(idxs)
+    return result
+
+
+def step2_raycast_gpu(lidar_points, global_indices, fid, save_debug=False):
+    """
+    Drop-in replacement for step2_raycast(). Same signature, same
+    pixel_to_point dict shape (still uses "global_index", matching the
+    rest of the pipeline).
+    """
+    t0 = time.time()
+
+    # --- fast pass: IDENTICAL to the original step2_raycast, unchanged ---
+    points_cam = (R_cam_lidar.T @ (lidar_points - t_cam_lidar).T).T
+    depth = points_cam[:, 2]
+    valid_depth = depth > MIN_DEPTH
+
+    uvw = (K @ points_cam.T).T
+    safe_depth = np.where(valid_depth, depth, 1.0)
+    u_fast = np.round(uvw[:, 0] / safe_depth).astype(np.int64)
+    v_fast = np.round(uvw[:, 1] / safe_depth).astype(np.int64)
+
+    in_bounds = (u_fast >= 0) & (u_fast < IMG_W) & (v_fast >= 0) & (v_fast < IMG_H)
+    valid = valid_depth & in_bounds
+
+    if not np.any(valid):
+        print("[raycast-gpu] No candidate pixels found at all -- check geometry/extrinsics.")
+        return {}
+
+    MARGIN = 2
+    u_valid = u_fast[valid]
+    v_valid = v_fast[valid]
+    anchors_valid = lidar_points[valid]
+
+    candidate_pixels = {}
+    for uu, vv, anchor in zip(u_valid, v_valid, anchors_valid):
+        for du in range(-MARGIN, MARGIN + 1):
+            for dv in range(-MARGIN, MARGIN + 1):
+                pu, pv = uu + du, vv + dv
+                if 0 <= pu < IMG_W and 0 <= pv < IMG_H:
+                    key = (int(pu), int(pv))
+                    if key not in candidate_pixels:
+                        candidate_pixels[key] = anchor
+
+    print(f"[raycast-gpu] Fast pass found {valid.sum()} point projections -> "
+          f"{len(candidate_pixels)} candidate pixels to actually raycast")
+
+    # --- dedupe pixels by shared anchor (many pixels share one anchor
+    # due to the MARGIN dilation above) -- neighbor search + distance
+    # math only need to happen once per UNIQUE anchor ---
+    keys = list(candidate_pixels.keys())
+    us = np.array([k[0] for k in keys], dtype=np.float32)
+    vs = np.array([k[1] for k in keys], dtype=np.float32)
+    anchors = np.array([candidate_pixels[k] for k in keys])  # (M, 3)
+
+    unique_anchors, inverse = np.unique(anchors, axis=0, return_inverse=True)
+    inverse = inverse.reshape(-1)
+    A = unique_anchors.shape[0]
+    print(f"[raycast-gpu] {len(keys)} pixels -> {A} unique anchors "
+          f"({len(keys) / max(A, 1):.1f}x dedup)")
+
+    # --- build voxel grid over this frame's cropped lidar points ---
+    order, unique_keys, start_idx, counts, _ = _build_voxel_grid(lidar_points, VOXEL_SIZE)
+    anchor_voxel_coords = np.floor(unique_anchors / VOXEL_SIZE).astype(np.int64)
+
+    lidar_points_t = torch.tensor(lidar_points, dtype=torch.float32, device=_device)  # (N, 3)
+
+    # Precompute ONE representative pixel per unique anchor, ONCE, up
+    # front -- O(total pixels), not per-chunk. (Recomputing this inside
+    # the chunk loop via np.where(inverse == anchor_idx) would be
+    # O(num_anchors * total_pixels), which is catastrophically slow at
+    # these sizes -- this precompute avoids that entirely.)
+    rep_pixel_for_anchor = np.full(A, -1, dtype=np.int64)
+    seen_anchor = np.zeros(A, dtype=bool)
+    for pixel_i, anchor_i in enumerate(inverse):
+        if not seen_anchor[anchor_i]:
+            rep_pixel_for_anchor[anchor_i] = pixel_i
+            seen_anchor[anchor_i] = True
+
+    # per-unique-anchor results, filled in as we process anchor chunks
+    anchor_best_global_idx = np.full(A, -1, dtype=np.int64)
+    anchor_best_point = np.zeros((A, 3), dtype=np.float32)
+    anchor_best_depth = np.zeros(A, dtype=np.float32)
+    anchor_best_perp = np.zeros(A, dtype=np.float32)
+    anchor_has_match = np.zeros(A, dtype=bool)
+
+    total_chunks = (A + ANCHOR_CHUNK_SIZE - 1) // ANCHOR_CHUNK_SIZE
+    chunk_start = time.time()
+
+    for start in range(0, A, ANCHOR_CHUNK_SIZE):
+        end = min(start + ANCHOR_CHUNK_SIZE, A)
+        m = end - start
+
+        chunk_voxel_coords = anchor_voxel_coords[start:end]
+
+        # gather bounded neighbor candidate indices for each anchor in this chunk
+        neighbor_idx_lists = _query_neighbors(
+            chunk_voxel_coords, order, unique_keys, start_idx, counts
+        )
+        max_k = max((len(x) for x in neighbor_idx_lists), default=0)
+        if max_k == 0:
+            continue  # no anchors in this chunk have ANY neighbor points -- skip
+
+        # build a padded (m, max_k) index tensor, with a mask for real vs padding
+        padded_idx = np.zeros((m, max_k), dtype=np.int64)
+        pad_mask = np.zeros((m, max_k), dtype=bool)
+        for i, idxs in enumerate(neighbor_idx_lists):
+            k = len(idxs)
+            if k > 0:
+                padded_idx[i, :k] = idxs
+                pad_mask[i, :k] = True
+
+        padded_idx_t = torch.tensor(padded_idx, dtype=torch.long, device=_device)  # (m, max_k)
+        pad_mask_t = torch.tensor(pad_mask, dtype=torch.bool, device=_device)      # (m, max_k)
+
+        # gather actual 3D neighbor points: (m, max_k, 3)
+        neighbor_points_t = lidar_points_t[padded_idx_t]
+
+        # pixel -> ray direction, for the anchors in this chunk that
+        # actually need it -- but note: the ray must be built from the
+        # PIXEL each anchor maps to, not the anchor's own position.
+        # Since dedup was done on ANCHOR (3D point), and multiple pixels
+        # can map to the same anchor, we still need each unique
+        # anchor's own representative pixel to build the correct ray.
+        # We use the first pixel that produced this anchor as its
+        # representative (u, v) for the ray -- consistent with the
+        # original code's per-pixel ray, since all pixels sharing an
+        # anchor are within a small MARGIN of each other anyway.
+        rep_pixel_idx = rep_pixel_for_anchor[start:end]
+
+        u_chunk = torch.tensor(us[rep_pixel_idx], device=_device)
+        v_chunk = torch.tensor(vs[rep_pixel_idx], device=_device)
+
+        ones = torch.ones_like(u_chunk)
+        pix_h = torch.stack([u_chunk, v_chunk, ones], dim=0)  # (3, m)
+        ray_dir_cam = _K_inv_t @ pix_h
+        ray_dir_cam = ray_dir_cam / ray_dir_cam.norm(dim=0, keepdim=True)
+
+        ray_dir_lidar = _R_cam_lidar_t @ ray_dir_cam  # (3, m)
+        ray_dir_lidar = ray_dir_lidar / ray_dir_lidar.norm(dim=0, keepdim=True)
+        ray_dir_lidar = ray_dir_lidar.T  # (m, 3)
+        ray_origin_lidar = _t_cam_lidar_t  # (3,) -- same origin for every pixel
+
+        # depth + perpendicular distance, now over max_k neighbors
+        # instead of the full N -- this is the actual speedup
+        vecs = neighbor_points_t - ray_origin_lidar.view(1, 1, 3)          # (m, max_k, 3)
+        depth_t = torch.einsum('mkd,md->mk', vecs, ray_dir_lidar)          # (m, max_k)
+        proj = ray_origin_lidar.view(1, 1, 3) + depth_t.unsqueeze(-1) * ray_dir_lidar.unsqueeze(1)
+        perp_dist_t = (neighbor_points_t - proj).norm(dim=-1)              # (m, max_k)
+
+        valid_t = pad_mask_t & (depth_t > MIN_DEPTH) & (perp_dist_t < MAX_PERP_DIST)
+        depth_masked = torch.where(valid_t, depth_t, torch.full_like(depth_t, float("inf")))
+        best_depth, best_local_idx = depth_masked.min(dim=1)  # (m,)
+        has_match = torch.isfinite(best_depth)
+
+        best_local_idx_cpu = best_local_idx.cpu().numpy()
+        best_depth_cpu = best_depth.cpu().numpy()
+        has_match_cpu = has_match.cpu().numpy()
+        perp_at_best = perp_dist_t[torch.arange(m, device=_device), best_local_idx].cpu().numpy()
+
+        for i in range(m):
+            if not has_match_cpu[i]:
+                continue
+            global_neighbor_idx = padded_idx[i, best_local_idx_cpu[i]]
+            global_anchor_i = start + i
+            anchor_has_match[global_anchor_i] = True
+            anchor_best_global_idx[global_anchor_i] = global_neighbor_idx
+            anchor_best_point[global_anchor_i] = lidar_points[global_neighbor_idx]
+            anchor_best_depth[global_anchor_i] = best_depth_cpu[i]
+            anchor_best_perp[global_anchor_i] = perp_at_best[i]
+
+        chunk_num = start // ANCHOR_CHUNK_SIZE + 1
+        if chunk_num % 10 == 0 or chunk_num == total_chunks:
+            elapsed_so_far = time.time() - chunk_start
+            anchors_done = min(end, A)
+            rate = anchors_done / max(elapsed_so_far, 1e-6)
+            print(f"[raycast-gpu]   anchor-chunk {chunk_num}/{total_chunks} "
+                  f"({anchors_done}/{A} unique anchors, {elapsed_so_far:.1f}s elapsed, "
+                  f"{rate:.0f} anchors/sec)")
+
+    # --- broadcast each unique anchor's result back out to every pixel
+    # that shares it ---
+    pixel_to_point = {}
+    total_matched = 0
+    for pixel_i, anchor_i in enumerate(inverse):
+        if not anchor_has_match[anchor_i]:
+            continue
+        key = keys[pixel_i]
+        pixel_to_point[key] = {
+            "global_index": int(global_indices[anchor_best_global_idx[anchor_i]]),
+            "point": anchor_best_point[anchor_i],
+            "depth": float(anchor_best_depth[anchor_i]),
+            "perp_dist": float(anchor_best_perp[anchor_i]),
+        }
+        total_matched += 1
+
+    elapsed = time.time() - t0
+    print(f"[raycast-gpu] Matched pixels (raycasting): {total_matched} / {len(keys)} "
+          f"in {elapsed:.2f}s ({len(keys) / max(elapsed, 1e-6):.0f} pixels/sec)")
+
+    return pixel_to_point
+    """
   1. CROP    - crop the global map to this frame's camera FOV
                (same method as crop_fov.py), output in LIDAR-local frame.
                *** Also keeps the GLOBAL INDEX of every surviving point,

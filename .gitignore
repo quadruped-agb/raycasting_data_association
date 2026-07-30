@@ -1,11 +1,20 @@
 # Generated outputs(not tracked), regenerate via the pipeline scripts
-output/
+# NOTE: "output/*" (not "output/") is used deliberately -- ignoring the
+# whole directory would block the negation rule below from working,
+# since git won't look inside a fully-ignored directory at all.
+output/*
+!output/dataset_index_glim_2.json
+
 *.ply
 *.pcd
 *.npy
+
 venv/
 __pycache__/
 *.pyc
-output/dataset_index*.json
+
 forest_49_map_new/
 forest_dataset_49/
+
+tests_cpu/
+tests/

@@ -5,7 +5,7 @@ import csv
 
 #load trajectory
 data = []
-with open("/home/administrator/Downloads/data_association/trajectory.csv", "r") as f:
+with open("output/trajectory.csv") as f:
     reader = csv.DictReader(f)
     for row in reader:
         data.append([
