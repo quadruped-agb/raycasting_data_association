@@ -1,11 +1,52 @@
 """
+colorize_global_map_voxel_gpu.py
 
+STANDALONE script: CPU voxelization + GPU-accelerated raycasting,
+all in one file. No import from raycasting_gpu.py or the plain CPU
+raycasting_glim.py -- step2 (GPU voxel-grid raycasting) is embedded
+directly below, with the ONE required fix applied at the source: its
+output dict key is "voxel_index" (matching what update_voxel_colors
+expects), not "global_index" (which is what the original, unmodified
+raycasting_gpu.py returns, and would otherwise cause a KeyError here).
 
-This uses its own checkpoint directory (checkpoint_gpu_test/) and its
-own output filenames (_gputest suffix), so it can never read from,
-write to, or otherwise interfere with your original full-run
-checkpoint/ or global_map_glim_colorized_2.ply.
+PIPELINE:
+  0. VOXELIZE - merge tightly-clustered near-duplicate points into
+       single representative points BEFORE any raycasting happens
+       (confirmed fix for low colorization coverage -- see
+       check_point_clustering.py). Each voxel's position is the
+       average of every original point inside it. point_to_voxel
+       maps every ORIGINAL point to its voxel, for broadcasting
+       colors back at the end.
+  1. CROP    - crop the VOXELIZED map to this frame's camera FOV,
+       output in LIDAR-local frame. Keeps the VOXEL INDEX of every
+       surviving voxel-point.
+  2. RAYCAST (GPU) - same voxel-grid-accelerated raycasting as
+       raycasting_gpu.py, embedded here, operating on voxel points
+       instead of raw points -- "closest point wins" now picks among
+       clean, de-duplicated targets. Returns "voxel_index" per match
+       (the required fix vs. the original file's "global_index").
+  3. COLORIZE - sample RGB at each matched pixel, write into a GLOBAL
+       VOXEL color buffer (sized to num_voxels, not num_points). Same
+       conflict-threshold blending as before, at voxel granularity.
+  4. BROADCAST - every voxel's final color gets copied onto ALL the
+       original raw points belonging to that voxel. Points whose
+       voxel never got a real color keep the original grayscale
+       fallback. Output has the EXACT SAME N points as
+       global_map_glim_2.ply -- nothing dropped, just far better
+       coverage since a whole duplicate-cluster now shares one
+       voxel's color instead of only whichever single point won
+       before.
 
+Output:
+    output/frame_<id>_cropped_map.ply           (debug, first MAX_DEBUG_FRAMES frames, VOXEL points, lidar-local frame)
+    output/frame_<id>_pixel_to_point.npy        (debug, first MAX_DEBUG_FRAMES frames, full-image (u,v) keys)
+    output/frame_<id>_image.*                   (debug, first MAX_DEBUG_FRAMES frames, copy of source camera image)
+    output/global_map_glim_colorized_voxel_gpu.ply (FINAL - same N points as global_map_glim_2.ply,
+                                                     camera RGB (broadcast from voxels) where matched,
+                                                     grayscale everywhere else. Input file NOT modified.)
+    output/checkpoint_voxel_gpu/                (resumable state, sized to NUM VOXELS: voxel_colors.npy,
+                                                  voxel_colored_mask.npy, voxel_color_counts.npy,
+                                                  processed_frames.json)
 """
 
 import os
@@ -17,6 +58,9 @@ import cv2
 import time
 import shutil
 
+# ---------------------------------------------------------------
+# Calibration (same as the rest of the pipeline)
+# ---------------------------------------------------------------
 T_cam_lidar = np.array([
     [0.906, 0.000, -0.423, 0.142],
     [0.000, 1.000,  0.000, 0.000],
@@ -38,37 +82,49 @@ IMG_W, IMG_H = 1920, 1080
 MAX_RANGE = 70.0
 MIN_DEPTH = 0.05
 
-# THE FIX: tighter tolerance + smaller dilation, defined right here,
-# local to this standalone file.
-MAX_PERP_DIST = 0.08
-RAYCAST_MARGIN = 1
+MAX_PERP_DIST = 0.15   # metres, raycasting tolerance -- flat value confirmed
+                        # best-performing via test_threshold_on_frames_cropped.py
+RAYCAST_MARGIN = 1      # 3x3 dilation (matches the CPU voxel script's MARGIN=1,
+                        # kept in sync for parity between CPU/GPU raycasting)
 
-VOXEL_SIZE = 0.5
+COLOR_MATCH_THRESHOLD = 0.20  # loosened from 0.12 -- see CPU voxel script's
+                               # comment: 0.12 rejected ~2x more legitimate
+                               # repeat observations than it accepted
+
+VOXEL_SIZE = 0.03  # metres, for merging near-duplicate map points before raycasting
+
+# GPU spatial-hash acceleration settings (a DIFFERENT, unrelated voxel
+# concept from VOXEL_SIZE above -- this one is just an internal
+# neighbor-search accelerator over whatever points get passed in each
+# frame, same as in raycasting_gpu.py)
+GPU_HASH_VOXEL_SIZE = 0.5
 NEIGHBOR_RING = 1
 ANCHOR_CHUNK_SIZE = 2048
 NEIGHBOR_CAP = 512
 _COORD_OFFSET = 1 << 20
 
-COLOR_MATCH_THRESHOLD = 0.12
-
-TEST_FRAME_IDS = {100, 200, 300, 400, 500}
 SAVE_PER_FRAME_DEBUG_FILES = True
+MAX_DEBUG_FRAMES = 20
 
 DATASET_INDEX_PATH = "output/dataset_index_glim_2.json"
 GLOBAL_MAP_PATH = "output/global_map_glim_2.ply"
 OUTPUT_DIR = "output"
-CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoint_gpu_test")
-CHECKPOINT_EVERY_N_FRAMES = 1
+CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoint_voxel_gpu")  # own dir -- never touches other checkpoints
+CHECKPOINT_EVERY_N_FRAMES = 20
 
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 if _device == "cpu":
-    print("[gpu-raycast] WARNING: CUDA not available -- running on CPU tensors.")
+    print("[voxel-gpu] WARNING: CUDA not available -- running on CPU tensors "
+          "(still batched/parallel, just not on GPU cores).")
 
 _K_inv_t = torch.tensor(K_inv, dtype=torch.float32, device=_device)
 _R_cam_lidar_t = torch.tensor(R_cam_lidar, dtype=torch.float32, device=_device)
 _t_cam_lidar_t = torch.tensor(t_cam_lidar, dtype=torch.float32, device=_device)
 
 
+# ---------------------------------------------------------------
+# Pose / transform helpers
+# ---------------------------------------------------------------
 def quaternion_to_matrix(x, y, z, w):
     return np.array([
         [1 - 2*(y**2 + z**2), 2*(x*y - z*w),       2*(x*z + y*w)],
@@ -93,16 +149,39 @@ def transform_points(points_local, T):
 
 
 # ---------------------------------------------------------------
-# STEP 1: crop to FOV (unchanged from the CPU pipeline)
+# STEP 0: voxelize the map ONCE, up front, before any frame processing
 # ---------------------------------------------------------------
-def step1_crop_to_fov(entry, fid, map_points, save_debug=False):
+def voxelize_map(map_points, voxel_size):
+    print(f"Voxelizing {map_points.shape[0]} points at {voxel_size}m resolution...")
+    voxel_coords = np.floor(map_points / voxel_size).astype(np.int64)
+
+    unique_voxels, point_to_voxel, counts = np.unique(
+        voxel_coords, axis=0, return_inverse=True, return_counts=True
+    )
+    num_voxels = unique_voxels.shape[0]
+
+    voxel_positions = np.zeros((num_voxels, 3), dtype=np.float64)
+    np.add.at(voxel_positions, point_to_voxel, map_points)
+    voxel_positions /= counts[:, None]
+
+    print(f"  -> {num_voxels} voxels "
+          f"({map_points.shape[0] / num_voxels:.1f}x reduction, "
+          f"avg {counts.mean():.1f} original points per voxel)")
+
+    return voxel_positions, point_to_voxel
+
+
+# ---------------------------------------------------------------
+# STEP 1: crop the VOXELIZED map to this frame's camera FOV
+# ---------------------------------------------------------------
+def step1_crop_to_fov(entry, fid, voxel_positions, save_debug=False):
     pose = entry["pose"]
 
     T_map_lidar = build_transform_matrix(pose["translation"], pose["quaternion"])
     T_map_cam = T_map_lidar @ T_cam_lidar
     T_cam_map = np.linalg.inv(T_map_cam)
 
-    points_cam = transform_points(map_points, T_cam_map)
+    points_cam = transform_points(voxel_positions, T_cam_map)
     depth = points_cam[:, 2]
     in_range = (depth > MIN_DEPTH) & (depth < MAX_RANGE)
 
@@ -112,26 +191,27 @@ def step1_crop_to_fov(entry, fid, map_points, save_debug=False):
     v = uvw[:, 1] / safe_depth
 
     in_fov = in_range & (u >= 0) & (u < IMG_W) & (v >= 0) & (v < IMG_H)
-    print(f"[crop] Points inside FOV : {in_fov.sum()} / {map_points.shape[0]}")
+    print(f"[crop] Voxels inside FOV : {in_fov.sum()} / {voxel_positions.shape[0]}")
 
-    global_indices = np.where(in_fov)[0]
-    cropped_points_map = map_points[in_fov]
+    voxel_indices = np.where(in_fov)[0]
 
+    cropped_voxels_map = voxel_positions[in_fov]
     T_lidar_map = np.linalg.inv(T_map_lidar)
-    cropped_points_lidar = transform_points(cropped_points_map, T_lidar_map)
+    cropped_voxels_lidar = transform_points(cropped_voxels_map, T_lidar_map)
 
     if save_debug:
         cropped_cloud = o3d.geometry.PointCloud()
-        cropped_cloud.points = o3d.utility.Vector3dVector(cropped_points_lidar)
-        cropped_map_path = os.path.join(OUTPUT_DIR, f"frame_{fid}_cropped_map_gputest.ply")
+        cropped_cloud.points = o3d.utility.Vector3dVector(cropped_voxels_lidar)
+        cropped_map_path = os.path.join(OUTPUT_DIR, f"frame_{fid}_cropped_map.ply")
         o3d.io.write_point_cloud(cropped_map_path, cropped_cloud)
         print(f"[crop] Saved: {cropped_map_path}")
 
-    return cropped_points_lidar, global_indices, T_map_lidar
+    return cropped_voxels_lidar, voxel_indices, T_map_lidar
 
 
 # ---------------------------------------------------------------
-# GPU voxel-grid raycasting helpers 
+# GPU voxel-grid raycasting helpers (embedded, spatial-hash accelerator --
+# unrelated to the VOXEL_SIZE de-duplication above)
 # ---------------------------------------------------------------
 def _pack_voxel_keys(voxel_coords):
     shifted = voxel_coords + _COORD_OFFSET
@@ -184,9 +264,13 @@ def _query_neighbors(anchor_voxel_coords, order, unique_keys, start_idx, counts)
 
 
 # ---------------------------------------------------------------
-# STEP 2: GPU raycasting (embedded copy, with MARGIN=1 / MAX_PERP_DIST=0.08)
+# STEP 2: GPU raycasting, operating on VOXEL points.
+# `voxel_indices[i]` gives the row in the FULL voxel array that
+# `lidar_points[i]` corresponds to. THE REQUIRED FIX: this returns
+# "voxel_index" (not "global_index"), matching what update_voxel_colors
+# expects below.
 # ---------------------------------------------------------------
-def step2_raycast_gpu(lidar_points, global_indices, fid, save_debug=False):
+def step2_raycast_gpu(lidar_points, voxel_indices, fid, save_debug=False):
     t0 = time.time()
 
     points_cam = (R_lidar_cam @ (lidar_points - t_cam_lidar).T).T
@@ -219,7 +303,7 @@ def step2_raycast_gpu(lidar_points, global_indices, fid, save_debug=False):
                     if key not in candidate_pixels:
                         candidate_pixels[key] = anchor
 
-    print(f"[raycast-gpu] Fast pass found {valid.sum()} point projections -> "
+    print(f"[raycast-gpu] Fast pass found {valid.sum()} voxel projections -> "
           f"{len(candidate_pixels)} candidate pixels to actually raycast "
           f"(MARGIN={RAYCAST_MARGIN}, MAX_PERP_DIST={MAX_PERP_DIST})")
 
@@ -234,8 +318,8 @@ def step2_raycast_gpu(lidar_points, global_indices, fid, save_debug=False):
     print(f"[raycast-gpu] {len(keys)} pixels -> {A} unique anchors "
           f"({len(keys) / max(A, 1):.1f}x dedup)")
 
-    order, unique_keys, start_idx, counts = _build_voxel_grid(lidar_points, VOXEL_SIZE)
-    anchor_voxel_coords = np.floor(unique_anchors / VOXEL_SIZE).astype(np.int64)
+    order, unique_keys, start_idx, counts = _build_voxel_grid(lidar_points, GPU_HASH_VOXEL_SIZE)
+    anchor_voxel_coords = np.floor(unique_anchors / GPU_HASH_VOXEL_SIZE).astype(np.int64)
 
     lidar_points_t = torch.tensor(lidar_points, dtype=torch.float32, device=_device)
 
@@ -246,7 +330,7 @@ def step2_raycast_gpu(lidar_points, global_indices, fid, save_debug=False):
             rep_pixel_for_anchor[anchor_i] = pixel_i
             seen_anchor[anchor_i] = True
 
-    anchor_best_global_idx = np.full(A, -1, dtype=np.int64)
+    anchor_best_voxel_row = np.full(A, -1, dtype=np.int64)
     anchor_best_point = np.zeros((A, 3), dtype=np.float32)
     anchor_best_depth = np.zeros(A, dtype=np.float32)
     anchor_best_perp = np.zeros(A, dtype=np.float32)
@@ -314,11 +398,12 @@ def step2_raycast_gpu(lidar_points, global_indices, fid, save_debug=False):
         for i in range(m):
             if not has_match_cpu[i]:
                 continue
-            global_neighbor_idx = padded_idx[i, best_local_idx_cpu[i]]
+            # index LOCAL to lidar_points (this frame's cropped voxel subset)
+            local_voxel_row = padded_idx[i, best_local_idx_cpu[i]]
             global_anchor_i = start + i
             anchor_has_match[global_anchor_i] = True
-            anchor_best_global_idx[global_anchor_i] = global_neighbor_idx
-            anchor_best_point[global_anchor_i] = lidar_points[global_neighbor_idx]
+            anchor_best_voxel_row[global_anchor_i] = local_voxel_row
+            anchor_best_point[global_anchor_i] = lidar_points[local_voxel_row]
             anchor_best_depth[global_anchor_i] = best_depth_cpu[i]
             anchor_best_perp[global_anchor_i] = perp_at_best[i]
 
@@ -337,8 +422,12 @@ def step2_raycast_gpu(lidar_points, global_indices, fid, save_debug=False):
         if not anchor_has_match[anchor_i]:
             continue
         key = keys[pixel_i]
+        local_voxel_row = anchor_best_voxel_row[anchor_i]
         pixel_to_point[key] = {
-            "global_index": int(global_indices[anchor_best_global_idx[anchor_i]]),
+            # FIX: "voxel_index" (row in the FULL voxel array, via
+            # voxel_indices passed in), not "global_index" -- matches
+            # what update_voxel_colors expects.
+            "voxel_index": int(voxel_indices[local_voxel_row]),
             "point": anchor_best_point[anchor_i],
             "depth": float(anchor_best_depth[anchor_i]),
             "perp_dist": float(anchor_best_perp[anchor_i]),
@@ -350,7 +439,7 @@ def step2_raycast_gpu(lidar_points, global_indices, fid, save_debug=False):
           f"in {elapsed:.2f}s ({len(keys) / max(elapsed, 1e-6):.0f} pixels/sec)")
 
     if save_debug:
-        pixel_to_point_path = os.path.join(OUTPUT_DIR, f"frame_{fid}_pixel_to_point_gputest.npy")
+        pixel_to_point_path = os.path.join(OUTPUT_DIR, f"frame_{fid}_pixel_to_point.npy")
         np.save(pixel_to_point_path, pixel_to_point, allow_pickle=True)
         print(f"[raycast-gpu] Saved: {pixel_to_point_path}")
 
@@ -358,9 +447,9 @@ def step2_raycast_gpu(lidar_points, global_indices, fid, save_debug=False):
 
 
 # ---------------------------------------------------------------
-# STEP 3: colorize (unchanged)
+# STEP 3: colorize -- writes into the VOXEL-level color buffer
 # ---------------------------------------------------------------
-def update_global_colors(pixel_to_point, image_file, global_colors, colored_mask, color_counts):
+def update_voxel_colors(pixel_to_point, image_file, voxel_colors, voxel_colored_mask, voxel_color_counts):
     image = cv2.imread(image_file)
     if image is None:
         raise FileNotFoundError(f"Could not read image: {image_file}")
@@ -371,22 +460,22 @@ def update_global_colors(pixel_to_point, image_file, global_colors, colored_mask
     conflict_count = 0
 
     for (u, v), info in pixel_to_point.items():
-        idx = info["global_index"]
+        idx = info["voxel_index"]
         new_color = image_rgb[v, u, :].astype(np.float64) / 255.0
 
-        if not colored_mask[idx]:
-            global_colors[idx] = new_color
-            colored_mask[idx] = True
-            color_counts[idx] = 1
+        if not voxel_colored_mask[idx]:
+            voxel_colors[idx] = new_color
+            voxel_colored_mask[idx] = True
+            voxel_color_counts[idx] = 1
             new_count += 1
         else:
-            existing_color = global_colors[idx]
+            existing_color = voxel_colors[idx]
             diff = np.linalg.norm(new_color - existing_color)
 
             if diff <= COLOR_MATCH_THRESHOLD:
-                n = color_counts[idx]
-                global_colors[idx] = (existing_color * n + new_color) / (n + 1)
-                color_counts[idx] = n + 1
+                n = voxel_color_counts[idx]
+                voxel_colors[idx] = (existing_color * n + new_color) / (n + 1)
+                voxel_color_counts[idx] = n + 1
                 updated_count += 1
             else:
                 conflict_count += 1
@@ -399,32 +488,72 @@ def rgb_to_grayscale(colors):
     return np.stack([luminance, luminance, luminance], axis=1)
 
 
-def load_checkpoint(n_points, map_colors_original):
-    required = ["global_colors.npy", "colored_mask.npy", "color_counts.npy", "processed_frames.json"]
-    if not all(os.path.exists(os.path.join(CHECKPOINT_DIR, f)) for f in required):
-        print("No test checkpoint found -- starting fresh.")
-        global_colors = rgb_to_grayscale(map_colors_original)
-        colored_mask = np.zeros(n_points, dtype=bool)
-        color_counts = np.zeros(n_points, dtype=np.int32)
-        return global_colors, colored_mask, color_counts, set()
+def format_duration(seconds):
+    """Human-readable H:M:S, so long full runs (hours) are easy to
+    read at a glance instead of just a raw seconds count."""
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    elif minutes > 0:
+        return f"{minutes}m {secs}s"
+    else:
+        return f"{secs}s"
 
-    global_colors = np.load(os.path.join(CHECKPOINT_DIR, "global_colors.npy"))
-    colored_mask = np.load(os.path.join(CHECKPOINT_DIR, "colored_mask.npy"))
-    color_counts = np.load(os.path.join(CHECKPOINT_DIR, "color_counts.npy"))
+
+def load_checkpoint(num_voxels):
+    required = ["voxel_colors.npy", "voxel_colored_mask.npy", "voxel_color_counts.npy", "processed_frames.json"]
+    if not all(os.path.exists(os.path.join(CHECKPOINT_DIR, f)) for f in required):
+        print("No voxel-gpu checkpoint found -- starting fresh.")
+        voxel_colors = np.zeros((num_voxels, 3), dtype=np.float64)
+        voxel_colored_mask = np.zeros(num_voxels, dtype=bool)
+        voxel_color_counts = np.zeros(num_voxels, dtype=np.int32)
+        return voxel_colors, voxel_colored_mask, voxel_color_counts, set()
+
+    voxel_colors = np.load(os.path.join(CHECKPOINT_DIR, "voxel_colors.npy"))
+    voxel_colored_mask = np.load(os.path.join(CHECKPOINT_DIR, "voxel_colored_mask.npy"))
+    voxel_color_counts = np.load(os.path.join(CHECKPOINT_DIR, "voxel_color_counts.npy"))
     with open(os.path.join(CHECKPOINT_DIR, "processed_frames.json"), "r") as f:
         processed_frame_ids = set(json.load(f))
 
-    print(f"Test checkpoint found: {len(processed_frame_ids)} of the target frames already processed.")
-    return global_colors, colored_mask, color_counts, processed_frame_ids
+    print(f"Voxel-gpu checkpoint found: {len(processed_frame_ids)} frames already processed "
+          f"-- resuming instead of starting over.")
+    return voxel_colors, voxel_colored_mask, voxel_color_counts, processed_frame_ids
 
 
-def save_checkpoint(global_colors, colored_mask, color_counts, processed_frame_ids):
+def save_checkpoint(voxel_colors, voxel_colored_mask, voxel_color_counts, processed_frame_ids):
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    np.save(os.path.join(CHECKPOINT_DIR, "global_colors.npy"), global_colors)
-    np.save(os.path.join(CHECKPOINT_DIR, "colored_mask.npy"), colored_mask)
-    np.save(os.path.join(CHECKPOINT_DIR, "color_counts.npy"), color_counts)
+    np.save(os.path.join(CHECKPOINT_DIR, "voxel_colors.npy"), voxel_colors)
+    np.save(os.path.join(CHECKPOINT_DIR, "voxel_colored_mask.npy"), voxel_colored_mask)
+    np.save(os.path.join(CHECKPOINT_DIR, "voxel_color_counts.npy"), voxel_color_counts)
     with open(os.path.join(CHECKPOINT_DIR, "processed_frames.json"), "w") as f:
         json.dump(sorted(processed_frame_ids), f)
+
+
+# ---------------------------------------------------------------
+# STEP 4: broadcast voxel colors back onto all original points
+# ---------------------------------------------------------------
+def build_and_save_point_level_output(map_points, map_colors_original, point_to_voxel,
+                                       voxel_colors, voxel_colored_mask, output_path):
+    n_points = map_points.shape[0]
+    print(f"\nBroadcasting voxel colors back onto {n_points} original points...")
+
+    final_colors = rgb_to_grayscale(map_colors_original)
+
+    point_voxel_colored = voxel_colored_mask[point_to_voxel]
+    final_colors[point_voxel_colored] = voxel_colors[point_to_voxel[point_voxel_colored]]
+
+    final_cloud = o3d.geometry.PointCloud()
+    final_cloud.points = o3d.utility.Vector3dVector(map_points)
+    final_cloud.colors = o3d.utility.Vector3dVector(final_colors)
+    o3d.io.write_point_cloud(output_path, final_cloud)
+
+    num_colored_points = int(point_voxel_colored.sum())
+    print(f"Saved: {output_path}")
+    print(f"  Total points in file : {n_points} (same as input map)")
+    print(f"  Points with real camera color (via their voxel) : {num_colored_points} "
+          f"({100.0 * num_colored_points / n_points:.1f}%)")
+    print(f"  Points kept as grayscale : {n_points - num_colored_points}")
 
 
 def main():
@@ -440,78 +569,83 @@ def main():
     n_points = map_points.shape[0]
     print(f"Loaded global map with {n_points} points\n")
 
-    global_colors, colored_mask, color_counts, processed_frame_ids = load_checkpoint(
-        n_points, map_colors_original
-    )
+    voxel_positions, point_to_voxel = voxelize_map(map_points, VOXEL_SIZE)
+    num_voxels = voxel_positions.shape[0]
+
+    voxel_colors, voxel_colored_mask, voxel_color_counts, processed_frame_ids = load_checkpoint(num_voxels)
 
     total_new = 0
     total_updated = 0
     total_conflicts = 0
     frames_done_this_run = 0
 
-    for entry in dataset:
+    for debug_index, entry in enumerate(dataset):
         fid = entry["frame_id"]
 
-        if fid not in TEST_FRAME_IDS:
-            continue
-
         if fid in processed_frame_ids:
-            print(f"\n=== Frame {fid} already processed in this test run -- skipping ===")
             continue
 
         frame_start = time.time()
-        print(f"\n=== Frame {fid} (standalone GPU test run) ===")
+        print(f"\n=== Frame {fid} (voxel + GPU raycasting) ===")
 
-        save_debug = SAVE_PER_FRAME_DEBUG_FILES
+        save_debug = SAVE_PER_FRAME_DEBUG_FILES and (debug_index < MAX_DEBUG_FRAMES)
 
         if save_debug:
             image_ext = os.path.splitext(entry["image_file"])[1]
-            image_copy_path = os.path.join(OUTPUT_DIR, f"frame_{fid}_image_gputest{image_ext}")
+            image_copy_path = os.path.join(OUTPUT_DIR, f"frame_{fid}_image{image_ext}")
             shutil.copy(entry["image_file"], image_copy_path)
             print(f"Saved copy of camera image: {image_copy_path}")
 
-        lidar_points, global_indices, T_map_lidar = step1_crop_to_fov(
-            entry, fid, map_points, save_debug=save_debug
+        lidar_points, voxel_indices, T_map_lidar = step1_crop_to_fov(
+            entry, fid, voxel_positions, save_debug=save_debug
         )
-        pixel_to_point = step2_raycast_gpu(lidar_points, global_indices, fid, save_debug=save_debug)
+        pixel_to_point = step2_raycast_gpu(lidar_points, voxel_indices, fid, save_debug=save_debug)
 
-        new_c, upd_c, conf_c = update_global_colors(
-            pixel_to_point, entry["image_file"], global_colors, colored_mask, color_counts
+        new_c, upd_c, conf_c = update_voxel_colors(
+            pixel_to_point, entry["image_file"], voxel_colors, voxel_colored_mask, voxel_color_counts
         )
         total_new += new_c
         total_updated += upd_c
         total_conflicts += conf_c
         processed_frame_ids.add(fid)
         frames_done_this_run += 1
-        print(f"[colorize] frame {fid}: {new_c} newly colored, "
-              f"{upd_c} blended into existing color, "
-              f"{conf_c} rejected as conflicting (> {COLOR_MATCH_THRESHOLD} threshold)")
+        print(f"[colorize] frame {fid}: {new_c} newly colored voxels, "
+              f"{upd_c} blended, {conf_c} rejected as conflicting (> {COLOR_MATCH_THRESHOLD} threshold)")
 
         frame_elapsed = time.time() - frame_start
         print(f"[timing] Frame {fid} took {frame_elapsed:.1f}s total")
 
         if frames_done_this_run % CHECKPOINT_EVERY_N_FRAMES == 0:
-            save_checkpoint(global_colors, colored_mask, color_counts, processed_frame_ids)
-            print(f"[checkpoint] Saved test progress ({len(processed_frame_ids)}/{len(TEST_FRAME_IDS)} target frames done)")
+            save_checkpoint(voxel_colors, voxel_colored_mask, voxel_color_counts, processed_frame_ids)
+            build_and_save_point_level_output(
+                map_points, map_colors_original, point_to_voxel,
+                voxel_colors, voxel_colored_mask,
+                os.path.join(OUTPUT_DIR, "global_map_glim_colorized_voxel_gpu.ply")
+            )
+            elapsed_so_far = time.time() - overall_start
+            print(f"[checkpoint] Saved progress ({len(processed_frame_ids)} frames total processed so far) "
+                  f"-- elapsed so far: {format_duration(elapsed_so_far)}")
 
-    save_checkpoint(global_colors, colored_mask, color_counts, processed_frame_ids)
+    save_checkpoint(voxel_colors, voxel_colored_mask, voxel_color_counts, processed_frame_ids)
 
-    final_cloud = o3d.geometry.PointCloud()
-    final_cloud.points = o3d.utility.Vector3dVector(map_points)
-    final_cloud.colors = o3d.utility.Vector3dVector(global_colors)
-
-    final_path = os.path.join(OUTPUT_DIR, "global_map_glim_colorized_gputest.ply")
-    o3d.io.write_point_cloud(final_path, final_cloud)
+    build_and_save_point_level_output(
+        map_points, map_colors_original, point_to_voxel,
+        voxel_colors, voxel_colored_mask,
+        os.path.join(OUTPUT_DIR, "global_map_glim_colorized_voxel_gpu.ply")
+    )
 
     total_elapsed = time.time() - overall_start
-    print(f"\nSaved test colorized global map: {final_path}")
-    print(f"  Total points in file      : {n_points} (same as input map)")
-    print(f"  Points with real camera color : {int(colored_mask.sum())}")
-    print(f"  Points kept as grayscale (no camera match) : {int((~colored_mask).sum())}")
-    print(f"Totals across test frames: {total_new} first-time colors, "
-          f"{total_updated} accepted blends, {total_conflicts} rejected conflicts")
-    print(f"[timing] Total: {total_elapsed:.1f}s for {frames_done_this_run} frames processed this run "
-          f"({total_elapsed / max(frames_done_this_run, 1):.1f}s average per frame)")
+    print(f"\n=== FINAL SUMMARY ===")
+    print(f"Frames in dataset               : {len(dataset)}")
+    print(f"Frames processed this run        : {frames_done_this_run}")
+    print(f"First-time voxel colors          : {total_new}")
+    print(f"Accepted blends                  : {total_updated}")
+    print(f"Rejected conflicts               : {total_conflicts}")
+    print(f"Total time                       : {format_duration(total_elapsed)} "
+          f"({total_elapsed:.1f}s)")
+    if frames_done_this_run > 0:
+        print(f"Average time per frame           : {format_duration(total_elapsed / frames_done_this_run)}")
+
 
 if __name__ == "__main__":
     main()
