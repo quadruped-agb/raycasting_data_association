@@ -23,7 +23,7 @@ Given a rosbag containing synchronized LiDAR scans, camera images, and robot pos
 
 ## Performance note
 
-This is the slowest branch -- the per-anchor `cKDTree` query is the bottleneck. See the `gpu` branch for a ~5x faster spatial-hash approach, or the `voxelization` branch for the fastest + cleanest (deduplicated) output.
+This is the slowest branch -- the per-anchor `cKDTree` query is the bottleneck. See the `gpu` branch for a ~4x faster approach, or the `voxelization` branch for the fastest + cleanest (deduplicated) output.
 
 ## Planned
 
