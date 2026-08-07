@@ -1,19 +1,8 @@
 """
-colorize_global_map_voxel_gpu.py
-
-STANDALONE script: CPU voxelization + GPU-accelerated raycasting,
-all in one file. No import from raycasting_gpu.py or the plain CPU
-raycasting_glim.py -- step2 (GPU voxel-grid raycasting) is embedded
-directly below, with the ONE required fix applied at the source: its
-output dict key is "voxel_index" (matching what update_voxel_colors
-expects), not "global_index" (which is what the original, unmodified
-raycasting_gpu.py returns, and would otherwise cause a KeyError here).
-
 PIPELINE:
   0. VOXELIZE - merge tightly-clustered near-duplicate points into
        single representative points BEFORE any raycasting happens
-       (confirmed fix for low colorization coverage -- see
-       check_point_clustering.py). Each voxel's position is the
+       Each voxel's position is the
        average of every original point inside it. point_to_voxel
        maps every ORIGINAL point to its voxel, for broadcasting
        colors back at the end.
@@ -21,32 +10,26 @@ PIPELINE:
        output in LIDAR-local frame. Keeps the VOXEL INDEX of every
        surviving voxel-point.
   2. RAYCAST (GPU) - same voxel-grid-accelerated raycasting as
-       raycasting_gpu.py, embedded here, operating on voxel points
+       raycasting_gpu.py pipeline, embedded here, operating on voxel points
        instead of raw points -- "closest point wins" now picks among
        clean, de-duplicated targets. Returns "voxel_index" per match
-       (the required fix vs. the original file's "global_index").
   3. COLORIZE - sample RGB at each matched pixel, write into a GLOBAL
-       VOXEL color buffer (sized to num_voxels, not num_points). Same
-       conflict-threshold blending as before, at voxel granularity.
+       VOXEL color buffer.
   4. BROADCAST - every voxel's final color gets copied onto ALL the
        original raw points belonging to that voxel. Points whose
        voxel never got a real color keep the original grayscale
-       fallback. Output has the EXACT SAME N points as
-       global_map_glim_2.ply -- nothing dropped, just far better
+       fallback. Output has the SAME N points as
+       global_map_glim_2.ply, just far better
        coverage since a whole duplicate-cluster now shares one
        voxel's color instead of only whichever single point won
        before.
 
 Output:
-    output/frame_<id>_cropped_map.ply           (debug, first MAX_DEBUG_FRAMES frames, VOXEL points, lidar-local frame)
-    output/frame_<id>_pixel_to_point.npy        (debug, first MAX_DEBUG_FRAMES frames, full-image (u,v) keys)
-    output/frame_<id>_image.*                   (debug, first MAX_DEBUG_FRAMES frames, copy of source camera image)
-    output/global_map_glim_colorized_voxel_gpu.ply (FINAL - same N points as global_map_glim_2.ply,
-                                                     camera RGB (broadcast from voxels) where matched,
-                                                     grayscale everywhere else. Input file NOT modified.)
-    output/checkpoint_voxel_gpu/                (resumable state, sized to NUM VOXELS: voxel_colors.npy,
-                                                  voxel_colored_mask.npy, voxel_color_counts.npy,
-                                                  processed_frames.json)
+    output/frame_<id>_cropped_map.ply           
+    output/frame_<id>_pixel_to_point.npy        
+    output/frame_<id>_image.*                  
+    output/global_map_glim_colorized_voxel_gpu.ply 
+    output/checkpoint_voxel_gpu/                
 """
 
 import os
@@ -59,8 +42,7 @@ import time
 import shutil
 
 # ---------------------------------------------------------------
-# Calibration (same as the rest of the pipeline)
-# ---------------------------------------------------------------
+# Calibration 
 T_cam_lidar = np.array([
     [0.906, 0.000, -0.423, 0.142],
     [0.000, 1.000,  0.000, 0.000],
@@ -82,21 +64,18 @@ IMG_W, IMG_H = 1920, 1080
 MAX_RANGE = 70.0
 MIN_DEPTH = 0.05
 
-MAX_PERP_DIST = 0.15   # metres, raycasting tolerance -- flat value confirmed
-                        # best-performing via test_threshold_on_frames_cropped.py
-RAYCAST_MARGIN = 1      # 3x3 dilation (matches the CPU voxel script's MARGIN=1,
-                        # kept in sync for parity between CPU/GPU raycasting)
+MAX_PERP_DIST = 0.15   # metres, raycasting tolerance -- value confirmed
+                        # best-performing via testing with different thresholds
+RAYCAST_MARGIN = 1      # best-performing margin selected
+                  
 
-COLOR_MATCH_THRESHOLD = 0.20  # loosened from 0.12 -- see CPU voxel script's
+COLOR_MATCH_THRESHOLD = 0.20  # loosened from 0.12 
                                # comment: 0.12 rejected ~2x more legitimate
                                # repeat observations than it accepted
 
 VOXEL_SIZE = 0.03  # metres, for merging near-duplicate map points before raycasting
 
-# GPU spatial-hash acceleration settings (a DIFFERENT, unrelated voxel
-# concept from VOXEL_SIZE above -- this one is just an internal
-# neighbor-search accelerator over whatever points get passed in each
-# frame, same as in raycasting_gpu.py)
+# GPU spatial-hash acceleration settings 
 GPU_HASH_VOXEL_SIZE = 0.5
 NEIGHBOR_RING = 1
 ANCHOR_CHUNK_SIZE = 2048
@@ -121,10 +100,7 @@ _K_inv_t = torch.tensor(K_inv, dtype=torch.float32, device=_device)
 _R_cam_lidar_t = torch.tensor(R_cam_lidar, dtype=torch.float32, device=_device)
 _t_cam_lidar_t = torch.tensor(t_cam_lidar, dtype=torch.float32, device=_device)
 
-
-# ---------------------------------------------------------------
 # Pose / transform helpers
-# ---------------------------------------------------------------
 def quaternion_to_matrix(x, y, z, w):
     return np.array([
         [1 - 2*(y**2 + z**2), 2*(x*y - z*w),       2*(x*z + y*w)],
@@ -210,8 +186,7 @@ def step1_crop_to_fov(entry, fid, voxel_positions, save_debug=False):
 
 
 # ---------------------------------------------------------------
-# GPU voxel-grid raycasting helpers (embedded, spatial-hash accelerator --
-# unrelated to the VOXEL_SIZE de-duplication above)
+# GPU voxel-grid raycasting helpers (embedded, spatial-hash accelerator)
 # ---------------------------------------------------------------
 def _pack_voxel_keys(voxel_coords):
     shifted = voxel_coords + _COORD_OFFSET
@@ -266,9 +241,9 @@ def _query_neighbors(anchor_voxel_coords, order, unique_keys, start_idx, counts)
 # ---------------------------------------------------------------
 # STEP 2: GPU raycasting, operating on VOXEL points.
 # `voxel_indices[i]` gives the row in the FULL voxel array that
-# `lidar_points[i]` corresponds to. THE REQUIRED FIX: this returns
-# "voxel_index" (not "global_index"), matching what update_voxel_colors
-# expects below.
+# `lidar_points[i]` corresponds to. 
+This returns
+# "voxel_index" 
 # ---------------------------------------------------------------
 def step2_raycast_gpu(lidar_points, voxel_indices, fid, save_debug=False):
     t0 = time.time()
