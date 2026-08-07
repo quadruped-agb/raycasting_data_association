@@ -1,6 +1,6 @@
 """
   1. CROP    - crop the global map to this frame's camera FOV
-               (same method as crop_fov.py), output in LIDAR-local frame.
+             , output in LIDAR-local frame.
                *** Also keeps the GLOBAL INDEX of every surviving point,
                so we can always trace a point back to its row in the
                one, single global map array. ***
@@ -15,12 +15,10 @@
        matched pixel and write it directly into a GLOBAL color buffer,
        indexed by that point's global index. This buffer starts as a
        GRAYSCALE version of global_map_glim.ply's own (height-based)
-       colors -- converted via standard luminance weighting -- and is
+       colors  and is
        shared across every frame, so there is no "merge all frames"
        step and no duplicate points from different frames -- each
-       global map point either gets a real camera color or it doesn't,
-       and it's always the SAME point (same row) that gets updated no
-       matter which frame colored it.
+       global map point either gets a real camera color or it doesn't.
 
        POINTS WITH NO CAMERA MATCH stay GRAYSCALE (their original
        height color desaturated to gray), so the full map's shape
@@ -40,31 +38,13 @@
        reflection, projection error, etc.) and is rejected -- the
        existing color is kept as-is.
 
-IMPORTANT NOTE ON PER-FRAME DEBUG FILES:
-       EVERY frame in the dataset is always cropped, raycasted, and
-       colorized into the ONE shared global color buffer -- that part
-       never changes based on frame count. What's limited is only the
-       optional per-frame DEBUG artifacts (the copied camera image and
-       the frame_<id>_cropped_map.ply), which are written to disk for
-       AT MOST the first MAX_DEBUG_FRAMES frames (see below), purely so
-       a human has a handful of example frames to inspect. Frames
-       beyond that limit still fully contribute their color data to
-       global_map_glim_colorized.ply -- they just don't get their own
-       per-frame files saved.
 
 Output:
-    output/frame_<id>_cropped_map.ply         (debug, first MAX_DEBUG_FRAMES frames only, from step 1, lidar-local frame)
-    output/frame_<id>_pixel_to_point.npy      (debug, first MAX_DEBUG_FRAMES frames only, from step 2, full-image (u,v) keys)
-    output/frame_<id>_image.*                 (debug, first MAX_DEBUG_FRAMES frames only, copy of the source camera image)
-    output/global_map_glim_colorized.ply      (FINAL - same N points as global_map_glim.ply,
-                                                camera RGB where matched, grayscale
-                                                everywhere else. Input file is
-                                                NOT modified. Includes ALL frames,
-                                                regardless of the debug-file limit above.)
-    output/checkpoint/                        (small resumable state: global_colors.npy,
-                                                colored_mask.npy, color_counts.npy,
-                                                processed_frames.json -- lets a later run
-                                                resume instead of starting over)
+    output/frame_<id>_cropped_map.ply        
+    output/frame_<id>_pixel_to_point.npy     
+    output/frame_<id>_image.*                 
+    output/global_map_glim_colorized.ply                                                                              
+    output/checkpoint/                       
 """
 
 import os
@@ -79,7 +59,7 @@ import shutil
 
 # Calibration (same as crop_fov.py / raycasting.py)
 #
-# NOTE: T_baselink_lidar has been removed. GLIM's poses (from
+#GLIM's poses (from
 # traj_lidar.txt, via dataset_index_glim.json) are already map->lidar
 # directly - GLIM has no base_link concept at all (its own sensor
 # config only defines lidar/imu/camera extrinsics). Composing through
@@ -109,22 +89,13 @@ MAX_RANGE = 70.0     # metres, Livox Mid360 spec
 MIN_DEPTH = 0.05     # metres, ignore points at/behind the camera
 MAX_PERP_DIST = 0.15 # metres, raycasting tolerance
 
-# NEW: how close (in normalized 0-1 RGB space, euclidean distance)
+# how close (in normalized 0-1 RGB space, euclidean distance)
 # a newly proposed color must be to a point's EXISTING color for it
-# to be accepted as "the same surface, different frame". Tune this:
+# to be accepted as "the same surface, different frame". 
 # smaller = stricter (more conflicts rejected), larger = looser.
 COLOR_MATCH_THRESHOLD = 0.12
 
-# Master on/off switch for per-frame DEBUG files (the image copy
-# frame_<id>_image.* and the cropped map frame_<id>_cropped_map.ply
-# and the frame_<id>_pixel_to_point.npy). These exist purely so a
-# human can inspect a specific frame later; the actual colorization
-# only ever uses the in-memory lidar_points / pixel_to_point / the
-# ORIGINAL image path (entry["image_file"]), never these saved copies.
-# Set to False to skip writing them entirely and save disk space --
-# global_map_glim_colorized.ply comes out byte-for-byte identical
-# either way. Set to True (default) to write them, but only for the
-# first MAX_DEBUG_FRAMES frames -- see below.
+#for debugging, we can save the first 20 outputs
 SAVE_PER_FRAME_DEBUG_FILES = True
 
 MAX_DEBUG_FRAMES = 20
@@ -135,7 +106,7 @@ GLOBAL_MAP_PATH = "output/global_map_glim_2.ply"
 OUTPUT_DIR = "output"
 CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoint")
 
-# NEW: save a small checkpoint (global_colors/colored_mask/color_counts
+#save a small checkpoint (global_colors/colored_mask/color_counts
 # + list of processed frame ids) every N frames, so if the run stops
 # for any reason (disk full, crash, manual interrupt), the NEXT run
 # automatically resumes from the first un-processed frame instead of
