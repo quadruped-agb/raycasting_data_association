@@ -110,10 +110,7 @@ CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoint")
 # + list of processed frame ids) every N frames, so if the run stops
 # for any reason (disk full, crash, manual interrupt), the NEXT run
 # automatically resumes from the first un-processed frame instead of
-# starting over or losing progress. This is independent of
-# SAVE_PER_FRAME_DEBUG_FILES -- the checkpoint is a handful of
-# map-sized arrays, not a per-frame file, so it stays small regardless
-# of how many frames have been processed.
+# starting over or losing progress. 
 CHECKPOINT_EVERY_N_FRAMES = 20
 
 
@@ -207,10 +204,6 @@ def find_nearest_point_near_anchor(tree, points, ray_origin, ray_dir, anchor,
     full point array. anchor is the 3D point whose projection
     generated this pixel, so the true nearest point is almost always
     within a small radius of it.
-
-    NOTE: returns an index LOCAL to `points` (this frame's cropped,
-    lidar-local subset). The caller is responsible for mapping that
-    back to the point's GLOBAL index via `global_indices`.
     """
     idxs = tree.query_ball_point(anchor, r=max_perp_dist * 3)
     if not idxs:
@@ -242,10 +235,7 @@ def find_nearest_point_near_anchor(tree, points, ray_origin, ray_dir, anchor,
 # its row index in the original, full-size `map_points` array. This
 # is what lets step 3 write colors back onto the ONE global map
 # instead of a per-frame copy.
-#
-# `save_debug` controls ONLY whether frame_<id>_cropped_map.ply gets
-# written for THIS frame -- it never affects cropping/raycasting
-# itself, so every frame is processed identically either way.
+
 def step1_crop_to_fov(entry, fid, map_points, save_debug=False):
     pose = entry["pose"]
 
@@ -364,8 +354,8 @@ def step2_raycast(lidar_points, global_indices, fid, save_debug=False):
     return pixel_to_point
 
 
-# STEP 3 (REPLACES old per-frame step3_colorize): sample RGB from the
-# full original image at each matched pixel, and write it straight
+# STEP 3 : sample RGB from the
+# full original image at each matched pixel, and write it 
 # into the GLOBAL color buffer at that point's global index.
 #
 # global_colors : (N, 3) float array, shared across all frames.
@@ -387,13 +377,8 @@ def step2_raycast(lidar_points, global_indices, fid, save_debug=False):
 # COLOR_MATCH_THRESHOLD (euclidean distance in normalized RGB), the
 # new observation is REJECTED and the existing color is left
 # untouched. If it's within the threshold, it's treated as "the same
-# surface seen again" and blended in via a running average.
-#
-# NOTE: this function ALWAYS runs, for every single frame -- it is
-# never gated by save_debug/MAX_DEBUG_FRAMES. The debug-file limit
-# only ever affects optional files written to disk for human
-# inspection; it never skips a frame's actual contribution to the
-# shared global color buffer.
+# surface seen again" and blended in via average.
+
 def update_global_colors(pixel_to_point, image_file, global_colors, colored_mask, color_counts):
     image = cv2.imread(image_file)
     if image is None:
@@ -622,8 +607,7 @@ def main():
     # input file, always. Points with a camera match now carry real
     # RGB (in global_colors); points with no match still carry
     # whatever was already in global_colors for them, which is a
-    # neutral grayscale version of the original height color (never
-    # given a fake/desaturated "camera" color). Nothing is
+    # neutral grayscale version of the original height color. Nothing is
     # dropped, and global_map_glim.ply itself is never modified --
     # this writes a brand new file. This includes the contribution of
     # EVERY frame processed above, not just the ones that got debug
