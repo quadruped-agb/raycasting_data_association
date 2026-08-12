@@ -242,7 +242,7 @@ def _query_neighbors(anchor_voxel_coords, order, unique_keys, start_idx, counts)
 # STEP 2: GPU raycasting, operating on VOXEL points.
 # `voxel_indices[i]` gives the row in the FULL voxel array that
 # `lidar_points[i]` corresponds to. 
-This returns
+#This returns
 # "voxel_index" 
 # ---------------------------------------------------------------
 def step2_raycast_gpu(lidar_points, voxel_indices, fid, save_debug=False):
